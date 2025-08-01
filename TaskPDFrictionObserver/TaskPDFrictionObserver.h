@@ -10,22 +10,23 @@
 #include <Poco/ClassLoader.h>
 #include <Poco/MetaObject.h>
 
-
 template<typename ROBOT>
 class TaskPDFrictionObserver : public NRMKControl::ControlAlgorithm<ROBOT>
 {
     /**< Type definitions for clarity and ease of maintenance */
     typedef NRMKControl::ControlAlgorithm<ROBOT> AlgorithmBase;
     typedef typename AlgorithmBase::ControlGains ControlGains;
-    typedef typename AlgorithmBase::CustomControlGains CustomControlGains;
     typedef typename NRMKControl::ControlAlgorithm<ROBOT>::MotionData MotionData;
     typedef typename NRMKControl::ControlAlgorithm<ROBOT>::ControlData ControlData;
     typedef typename ROBOT::JointVec JointVec;
     typedef typename ROBOT::JointMat JointMat;
     typedef typename ROBOT::TaskPosition  TaskPosition;
     typedef typename ROBOT::TaskVelocity TaskVelocity;
+    typedef typename ROBOT::TaskAcceleration TaskAcceleration;
     typedef typename ROBOT::ExtendedPosition ExtendedPosition;
     typedef typename ROBOT::ExtendedVelocity ExtendedVelocity;
+    typedef typename ROBOT::ExtendedAcceleration ExtendedAcceleration;
+    typedef typename ROBOT::ExtendedForce ExtendedForce;
     typedef typename ROBOT::ExtendedTaskJacobian ExtendedTaskJacobian;
     typedef typename ROBOT::ExtendedTaskVec ExtendedTaskVec;
 
@@ -42,25 +43,25 @@ public:
     void initializeNominalRobot(ROBOT & robot);
     // JointVec friction_observer_L1_PD(ROBOT &robot, const LieGroup::Vector3D& gravDir,  const JointVec &Control_input,  const MotionData &motionData, ControlData &controlData);  
 private:
+    std::unique_ptr<ROBOT> _robotNominal;
+    bool _sim_mode;
     int debug_cnt;
     bool is_soft_estop_ = false;
     double _delT, currentT_;
-    JointVec _kp;
-    JointVec _kv;
-    JointVec _ki;
 
-    JointVec fric_gain_;
-    Eigen::MatrixXd Gamma_, Gamma_p_, L_, Lp_, B_;
-    JointVec Gamma_vec_, Gamma_p_vec_, L_vec_, Lp_vec_, K_lpf_vec_, B_vec_, J_lpf_vec_;
+    Eigen::MatrixXd L_, Lp_, B_;
+    JointVec L_vec_, Lp_vec_, K_lpf_vec_, B_vec_, J_lpf_vec_;
     JointVec tau_j_, tau_j_lpf_, tau_j_prev_;
     JointVec tau_f_prev_, theta_n_, dtheta_n_;
-    
+    JointVec tau_grav_, tau_gravNom_;
+ 
     /* Task-space controller variables */
-    JointVec Kp_task_, Kd_task_;
+    JointVec Kp_task_vec_, Kd_task_vec_ ;  
+    JointMat Kp_task_, Kd_task_;
     ExtendedPosition tpos_d_;
-    ExtendedPosition tpos_;
-    ExtendedVelocity tvel_;
-    ExtendedTaskJacobian J_, Jdot_;
+    ExtendedPosition tpos_, tposNom_;
+    ExtendedVelocity tvel_, tvelNom_;
+    ExtendedTaskJacobian J_, Jdot_, JNom_, JdotNom_;
     /* Task-space controller variables end */
 
     /* JTS initialization variables */
@@ -78,17 +79,12 @@ private:
     JointVec dK_L_vec_;
     /* Friction Observer initialization variables end */
 
-    /* Task trajectory variables */
-    double traj_start_;
-    double traj_duration_;
-    Eigen::Vector3d traj_;
-
-    /* Task trajectory variables end */
-
     JointVec Kp_, Kd_, PW_;
     std::ofstream file_;
     double printT_ = 0.0;
-    double printT2_ = 0.0;
+
+    JointMat _Mn, _Cn, _Mhat;
+    JointVec _gn;
 };
 
 /**< Class creator to facilitate dynamic loading if necessary */

@@ -3,35 +3,26 @@
 template<typename ROBOT>
 void TaskPDFrictionObserver<ROBOT>::initialize(ROBOT &robot, double delt)
 {
-    /**< Initialize the H-infinity controller with the given time step */
-    robot.initHinfController(delt);
-    /**< Reset the integral terms in the H-inifinity control algorithm */
-    robot.resetHinfController();
+    _robotNominal = std::make_unique<ROBOT>(robot);
     reset(robot);
-
     debug_cnt = 3;
     is_soft_estop_ = false;
     file_.open("LPF_log.csv");
     _delT = delt;
     currentT_ = 0;
-        /* Friction Observer initialization reset */
-    reset(robot);
     printT_ = 0.0;
-    printT2_ = 0.0;
+      /**< initialization */
+    J_.setZero(); Jdot_.setZero(); 
 
 }
 
 template<typename ROBOT>
 void TaskPDFrictionObserver<ROBOT>::reset(ROBOT& robot)
-{
-    /**< Reset the integral terms in the H-inifinity control algorithm */
-    robot.resetHinfController();
-    
-    /* Task-space controller reset */
-    robot.computeFK(tpos_d_);
+{ 
     /* Task-space controller reset end */
     theta_n_ = robot.q();
     dtheta_n_ = robot.qdot();
+
     fo_init_status_ = 0;
     fo_init_cnt_ = 0;
     L_vec_.setZero();
@@ -58,6 +49,8 @@ void TaskPDFrictionObserver<ROBOT>::reset(ROBOT& robot)
     fo_init_cnt_ = 0;
     fo_init_cnt_total_ = static_cast<int>(fo_init_duration_ / _delT);
     /* Friction Observer initialization init end */
+
+    initializeNominalRobot(robot);
 
     /* Friction Observer initialization reset end */
     std::cout << "========== RESET HAS CALLED ==========" << std::endl;
@@ -97,7 +90,7 @@ void TaskPDFrictionObserver<ROBOT>::compute(ROBOT &robot, const LieGroup::Vector
         return;
     }
         
-    if (is_soft_estop_ || std::abs(robot.qdot().maxCoeff()) > 1.3) {
+    if (is_soft_estop_ || std::abs(robot.qdot().maxCoeff()) > 1.5) {
         controlData.controlTorque.tau = gravity_compensation_torque;
         is_soft_estop_ = true;
         std::cout << "EMERGENCY!!! : qdot exceeded" << std::endl;
@@ -129,13 +122,43 @@ void TaskPDFrictionObserver<ROBOT>::compute(ROBOT &robot, const LieGroup::Vector
         new_tau = gravity_compensation_torque;
     }
     /* JTS initialization end */
-    // -------------------------------- JOINT CONTROLLER -------------------------------------------------------
+    // -------------------------------- Task CONTROLLER -------------------------------------------------------
     else {
-        JointVec de_nr = dtheta_n_ - robot.qdot();
-        JointVec e_nr = theta_n_ - robot.q();
-        control_motor_torque = - Kp_.cwiseProduct(robot.q() - motionData.motionPoint.qd) - Kd_.cwiseProduct( robot.qdot() - motionData.motionPoint.qdotd) + gravity_compensation_torque;
-        PDinput = - Kp_.cwiseProduct(theta_n_ - motionData.motionPoint.qd) - Kd_.cwiseProduct(dtheta_n_) + gravity_compensation_torque;
-        
+        Kp_task_vec_ = this->gain1;
+        Kd_task_vec_ = this->gain2;
+        if (Kp_task_vec_.minCoeff() > 0)
+            Kp_task_.diagonal() << Kp_task_vec_;
+        if (Kd_task_vec_.minCoeff() > 0)
+            Kd_task_.diagonal() << Kd_task_vec_;
+
+        _robotNominal->computeDynamicsParams(gravDir, _Mn, _Cn, _gn);
+        robot.idyn_gravity(gravDir);
+        robot.computeFK(tpos_, tvel_);
+        robot.computeJacobian(tpos_, tvel_, J_, Jdot_);
+
+        _robotNominal->idyn_gravity(gravDir);
+        _robotNominal->computeFK(tposNom_, tvelNom_);
+        _robotNominal->computeJacobian(tposNom_, tvelNom_, JNom_, JdotNom_);
+
+        tau_grav_ = robot.tau();
+        tau_gravNom_ = _robotNominal->tau();
+
+        ExtendedTaskVec e, edot;
+        e.setZero();
+        edot.setZero();
+
+        ExtendedPosition posDesired; posDesired.setZero();
+        posDesired.R()  = motionData.motionPoint.pd.R();
+        posDesired.r()  = motionData.motionPoint.pd.r();
+
+        ExtendedVelocity velDesired; velDesired.setZero();
+        // velDesired.v()  = motionData.motionPoint.pdotd.v();
+        // velDesired.w()  = motionData.motionPoint.pdotd.w();
+
+        _robotNominal->computeTaskErr(tposNom_, tvelNom_, posDesired, velDesired, e, edot);
+
+        JointVec tau_task = JNom_.transpose() * ( Kp_task_  * e + Kd_task_ * edot) + gravity_compensation_torque; 
+
         // Calculate PD Observer // 
         if (this->gain5.minCoeff() > 0) {
             switch (fo_init_status_) {
@@ -159,7 +182,8 @@ void TaskPDFrictionObserver<ROBOT>::compute(ROBOT &robot, const LieGroup::Vector
             }
         }
         L_.diagonal() << L_vec_;
-        
+        JointVec de_nr = _robotNominal->qdot() - robot.qdot();
+        JointVec e_nr = _robotNominal->q() - robot.q();
         friction_compensation_torque = -B_ * L_ * (de_nr + Lp_ * e_nr);
         tau_j_ = controlData.controlTorque.tauJTS;
         tau_j_(1) = - controlData.controlTorque.tauJTS(1);
@@ -171,19 +195,29 @@ void TaskPDFrictionObserver<ROBOT>::compute(ROBOT &robot, const LieGroup::Vector
         tau_j_lpf_ = Beta * tau_j_prev_ + (I - Beta) * tau_j_;
         tau_j_prev_ = tau_j_lpf_;
 
-        JointVec qddotNom ;
-        qddotNom.setZero();
-        qddotNom = B_.inverse() * ( PDinput - tau_j_lpf_ );   
-        dtheta_n_ += _delT * qddotNom;
-        theta_n_ += _delT * dtheta_n_;
-        new_tau = PDinput - friction_compensation_torque;
+        JointVec qddotNom ; qddotNom.setZero();
+        qddotNom = B_.inverse() * ( tau_task - tau_j_lpf_ );   
+        _robotNominal->qdot() += _delT*qddotNom;
+        _robotNominal->q() += _delT*_robotNominal->qdot();
+        _robotNominal->update();
+        _robotNominal->updateJacobian();
 
-        // new_tau = control_motor_torque;
+        new_tau = tau_task - friction_compensation_torque;
     }
     currentT_ += _delT;
     controlData.controlTorque.tau = new_tau;
 }
-
+template<typename ROBOT>
+void TaskPDFrictionObserver<ROBOT>::initializeNominalRobot(ROBOT & robot)
+{
+    /**< Initialize nominal robot with the actual robot state and update */
+    _robotNominal->setTtarget(robot.Ttarget().R(), robot.Ttarget().r());
+    _robotNominal->setTReference(robot.Tref().R(), robot.Tref().r());
+    _robotNominal->q() = robot.q();
+    _robotNominal->qdot() = robot.qdot();
+    _robotNominal->update();
+    _robotNominal->updateJacobian();
+}
 /**< Manifest to allow dynamic loading of the control algorithm */
 POCO_BEGIN_MANIFEST(NRMKControl::ControlAlgorithmCreator)
         POCO_EXPORT_CLASS(TaskPDFrictionObserverCreator)
